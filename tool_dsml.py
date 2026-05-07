@@ -222,7 +222,8 @@ def _format_param_node(name: str, value: Any, indent: str) -> str:
     if value is None:
         return f"{indent}{open_tag}{close}"
     if isinstance(value, (dict, list)):
-        return f"{indent}{open_tag}{close}"
+        serialized = json.dumps(value, ensure_ascii=False)
+        return f"{indent}{open_tag}{_cdata(serialized)}{close}"
     if isinstance(value, (bool, int, float)):
         return f"{indent}{open_tag}{str(value)}{close}"
     return f"{indent}{open_tag}{_cdata(str(value))}{close}"

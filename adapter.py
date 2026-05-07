@@ -7,6 +7,7 @@ import os
 import time
 import struct
 import base64
+import threading
 import httpx
 from dotenv import load_dotenv
 from wasmtime import Store, Module, Instance
@@ -30,9 +31,10 @@ class PoWError(Exception):
 
 
 class _WASMSolver:
-    """WASM-based PoW solver (reused across calls)"""
+    """WASM-based PoW solver (reused across calls) — thread-safe via lock."""
 
     def __init__(self):
+        self._lock = threading.Lock()
         self.store = Store()
         module = Module(self.store.engine, _WASM_BYTES)
         instance = Instance(self.store, module, [])
@@ -41,6 +43,8 @@ class _WASMSolver:
         self.wasm_solve = exports["wasm_solve"]
         self.add_to_stack = exports["__wbindgen_add_to_stack_pointer"]
         self.malloc = exports["__wbindgen_export_0"]
+        self._wbindgen_free = exports["__wbindgen_export_2"]
+        self._allocations: list[tuple[int, int]] = []
 
     def _encode(self, s: str):
         data = s.encode("utf-8")
@@ -48,23 +52,36 @@ class _WASMSolver:
         mem = self.memory.data_ptr(self.store)
         for i, b in enumerate(data):
             mem[ptr + i] = b
+        self._allocations.append((ptr, len(data)))
         return ptr, len(data)
 
+    def _free_allocations(self):
+        for ptr, length in self._allocations:
+            try:
+                self._wbindgen_free(self.store, ptr, length, 1)
+            except Exception:
+                pass
+        self._allocations.clear()
+
     def solve(self, challenge: str, salt: str, expire_at: int, difficulty: int) -> int:
-        prefix = f"{salt}_{expire_at}_"
-        stack_ptr = self.add_to_stack(self.store, -16)
-        chal_ptr, chal_len = self._encode(challenge)
-        prefix_ptr, prefix_len = self._encode(prefix)
-        self.wasm_solve(self.store, stack_ptr, chal_ptr, chal_len,
-                        prefix_ptr, prefix_len, float(difficulty))
-        mem = self.memory.data_ptr(self.store)
-        ret = int.from_bytes(bytes(mem[stack_ptr:stack_ptr + 4]),
-                             byteorder='little', signed=True)
-        if ret == 0:
-            raise PoWError("WASM solver found no solution")
-        result = struct.unpack('<d', bytes(mem[stack_ptr + 8:stack_ptr + 16]))[0]
-        self.add_to_stack(self.store, 16)
-        return int(result)
+        with self._lock:
+            try:
+                prefix = f"{salt}_{expire_at}_"
+                stack_ptr = self.add_to_stack(self.store, -16)
+                chal_ptr, chal_len = self._encode(challenge)
+                prefix_ptr, prefix_len = self._encode(prefix)
+                self.wasm_solve(self.store, stack_ptr, chal_ptr, chal_len,
+                                prefix_ptr, prefix_len, float(difficulty))
+                mem = self.memory.data_ptr(self.store)
+                ret = int.from_bytes(bytes(mem[stack_ptr:stack_ptr + 4]),
+                                     byteorder='little', signed=True)
+                if ret == 0:
+                    raise PoWError("WASM solver found no solution")
+                result = struct.unpack('<d', bytes(mem[stack_ptr + 8:stack_ptr + 16]))[0]
+                self.add_to_stack(self.store, 16)
+                return int(result)
+            finally:
+                self._free_allocations()
 
 
 class DeepSeekAdapter:
@@ -102,8 +119,14 @@ class DeepSeekAdapter:
             json={"target_path": target_path},
             headers=self._base_headers,
         )
+        resp.raise_for_status()
         data = resp.json()
-        return data["data"]["biz_data"]["challenge"]
+        try:
+            return data["data"]["biz_data"]["challenge"]
+        except (KeyError, TypeError) as e:
+            raise RuntimeError(
+                f"Unexpected challenge response structure: {data.get('code', 'unknown')} - {data.get('msg', str(e))}"
+            )
 
     def _solve(self, challenge_data: dict) -> str:
         nonce = self.solver.solve(
@@ -288,14 +311,10 @@ class DeepSeekAdapter:
             json=body, headers=headers,
         ) as resp:
             frag_type = None  # None, 'thinking', 'content'
-            current_event = ""
 
             for line in resp.iter_lines():
                 line = line.strip()
                 if not line:
-                    continue
-                if line.startswith("event: "):
-                    current_event = line[7:]
                     continue
                 if not line.startswith("data: "):
                     continue

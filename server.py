@@ -32,8 +32,10 @@ THINKING = os.environ.get("THINKING", "auto").strip().lower()
 app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.1.0-pre")
 adapter = DeepSeekAdapter(token=TOKEN, cookies=COOKIES)
 
-# In-memory session store
-_sessions: dict[str, str] = {}
+# In-memory session store with timestamps for TTL-based cleanup
+# Mapping: proxy_sid -> (ds_session_id, created_at)
+_sessions: dict[str, tuple[str, float]] = {}
+_SESSION_TTL = 300  # 5 minutes
 
 
 # ---- Pydantic models ----
@@ -100,17 +102,27 @@ class ModelList(BaseModel):
 
 # ---- Session helpers ----
 
+def _cleanup_expired_sessions():
+    """Remove sessions older than TTL."""
+    now = time.time()
+    expired = [sid for sid, (_, ts) in _sessions.items() if now - ts > _SESSION_TTL]
+    for sid in expired:
+        del _sessions[sid]
+
+
 def _get_session() -> str:
+    _cleanup_expired_sessions()
     sid = str(uuid.uuid4())
     ds_session = adapter.create_session()
-    _sessions[sid] = ds_session
+    _sessions[sid] = (ds_session, time.time())
     return sid
 
 
 def _get_ds_session(proxy_sid: str) -> str:
-    ds = _sessions.get(proxy_sid)
-    if ds is None:
+    entry = _sessions.get(proxy_sid)
+    if entry is None:
         raise HTTPException(status_code=400, detail="Session not found")
+    ds, _ = entry
     return ds
 
 
@@ -130,16 +142,16 @@ def _build_prompt(messages: list[ChatMessage], tools: list[ToolDef] | None = Non
     """Build a prompt string from messages, injecting tool definitions if present."""
     parts = []
 
-    # Inject tool prompt into system message
+    tool_prompt_text = None
     if tools:
         tool_prompt_text = build_dsml_tool_prompt([t.model_dump() for t in tools])
-        if tool_prompt_text:
-            parts.append(f"System: {tool_prompt_text}")
+
+    has_system_message = any(m.role == "system" for m in messages)
 
     for m in messages:
         if m.role == "system":
             text = _extract_text(m.content)
-            if tools:
+            if tool_prompt_text:
                 text = text + "\n\n" + tool_prompt_text if text else tool_prompt_text
             if text:
                 parts.append(f"System: {text}")
@@ -159,6 +171,10 @@ def _build_prompt(messages: list[ChatMessage], tools: list[ToolDef] | None = Non
         elif m.role == "tool":
             result = _extract_text(m.content)
             parts.append(f"Tool result: {result[:1000]}")
+
+    # Only inject standalone tool prompt if there is no system message to attach it to
+    if tool_prompt_text and not has_system_message:
+        parts.insert(0, f"System: {tool_prompt_text}")
 
     return "\n".join(parts)
 
@@ -254,11 +270,13 @@ async def chat_completions(req: ChatCompletionRequest):
     proxy_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     prompt = _build_prompt(req.messages, req.tools)
 
-    # MODE controls model_type (quick → null, expert → "expert")
+    # MODE controls model_type
     if MODE == "expert":
         model_type = "expert"
+    elif MODE == "quick":
+        model_type = None
     else:
-        model_type = "default"  # quick mode or auto
+        model_type = None  # auto mode, may be overridden if thinking is enabled below
 
     # THINKING controls thinking_enabled independent of mode
     if THINKING == "enabled":
@@ -267,6 +285,10 @@ async def chat_completions(req: ChatCompletionRequest):
         thinking = False
     else:
         thinking = req.thinking_mode or False
+
+    # auto mode: thinking implies expert model type
+    if MODE == "auto" and thinking:
+        model_type = "expert"
 
     search = req.search_enabled or False
 
