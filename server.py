@@ -270,13 +270,11 @@ async def chat_completions(req: ChatCompletionRequest):
     proxy_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     prompt = _build_prompt(req.messages, req.tools)
 
-    # MODE controls model_type
+    # MODE controls model_type (quick → "default", expert → "expert")
     if MODE == "expert":
         model_type = "expert"
-    elif MODE == "quick":
-        model_type = None
     else:
-        model_type = None  # auto mode, may be overridden if thinking is enabled below
+        model_type = "default"  # quick mode or auto, matches native request format
 
     # THINKING controls thinking_enabled independent of mode
     if THINKING == "enabled":
@@ -286,9 +284,7 @@ async def chat_completions(req: ChatCompletionRequest):
     else:
         thinking = req.thinking_mode or False
 
-    # auto mode: thinking implies expert model type
-    if MODE == "auto" and thinking:
-        model_type = "expert"
+    search = req.search_enabled or False
 
     search = req.search_enabled or False
 
