@@ -32,10 +32,8 @@ THINKING = os.environ.get("THINKING", "auto").strip().lower()
 app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.1.0-pre")
 adapter = DeepSeekAdapter(token=TOKEN, cookies=COOKIES)
 
-# In-memory session store with timestamps for TTL-based cleanup
-# Mapping: proxy_sid -> (ds_session_id, created_at)
-_sessions: dict[str, tuple[str, float]] = {}
-_SESSION_TTL = 300  # 5 minutes
+# In-memory session store
+_sessions: dict[str, str] = {}
 
 
 # ---- Pydantic models ----
@@ -102,27 +100,17 @@ class ModelList(BaseModel):
 
 # ---- Session helpers ----
 
-def _cleanup_expired_sessions():
-    """Remove sessions older than TTL."""
-    now = time.time()
-    expired = [sid for sid, (_, ts) in _sessions.items() if now - ts > _SESSION_TTL]
-    for sid in expired:
-        del _sessions[sid]
-
-
 def _get_session() -> str:
-    _cleanup_expired_sessions()
     sid = str(uuid.uuid4())
     ds_session = adapter.create_session()
-    _sessions[sid] = (ds_session, time.time())
+    _sessions[sid] = ds_session
     return sid
 
 
 def _get_ds_session(proxy_sid: str) -> str:
-    entry = _sessions.get(proxy_sid)
-    if entry is None:
+    ds = _sessions.get(proxy_sid)
+    if ds is None:
         raise HTTPException(status_code=400, detail="Session not found")
-    ds, _ = entry
     return ds
 
 
