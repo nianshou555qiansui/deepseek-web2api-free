@@ -196,6 +196,103 @@ data: [DONE]
 
 ---
 
+### `POST /v1/messages`
+
+Anthropic Claude API 兼容的聊天补全接口。
+
+#### 请求体
+
+```json
+{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {"role": "user", "content": "Hello!"}
+  ],
+  "system": "You are a helpful assistant.",
+  "stream": false,
+  "thinking": {"type": "enabled", "budget_tokens": 16000},
+  "tools": [
+    {"name": "get_weather", "description": "获取天气", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}
+  ]
+}
+```
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `model` | `string` | `"claude-3-5-sonnet-20241022"` | 模型名称（不影响实际模型，仅用于标识） |
+| `messages` | `array` | 必填 | 消息列表，支持 `user`/`assistant` 角色 |
+| `system` | `string\|array` | `null` | 系统提示词 |
+| `stream` | `boolean` | `false` | 是否流式输出 |
+| `thinking` | `object` | `null` | `{"type": "enabled"}` 开启思考模式 |
+| `tools` | `array` | `null` | Anthropic 格式的工具定义（`name`/`description`/`input_schema`） |
+| `max_tokens` | `int` | `null` | 被忽略（DeepSeek 不支持） |
+| `metadata` | `object` | `null` | 被忽略 |
+| `stop_sequences` | `array` | `null` | 被忽略 |
+
+#### 非流式响应（`stream: false`）
+
+```json
+{
+  "id": "msg_xxxxxxxxxxxxxxxxxxxxxxxx",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {"type": "text", "text": "你好！有什么可以帮助你的吗？"}
+  ],
+  "model": "deepseek-chat",
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {"input_tokens": -1, "output_tokens": -1}
+}
+```
+
+工具调用时：
+
+```json
+"content": [
+  {"type": "tool_use", "id": "toolu_xxx", "name": "get_weather", "input": {"city": "北京"}}
+],
+"stop_reason": "tool_use"
+```
+
+#### 流式响应（`stream: true`）
+
+Anthropic 原生 SSE 格式，包含 `message_start`、`content_block_start`、`content_block_delta`、`content_block_stop`、`message_delta`、`message_stop` 事件：
+
+```
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_...","type":"message","role":"assistant","content":[],"model":"deepseek-chat","stop_reason":null,...}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"推理过程..."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"回答内容"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":-1}}
+
+event: message_stop
+data: {}
+```
+
+> **注意**: Anthropic 端点与 OpenAI 端点共享相同的底层 adapter，MODE/THINKING/SEARCH 环境变量同时影响两个端点。
+
+---
+
 ## MODE / THINKING / SEARCH 详解
 
 这三个环境变量是独立的控制维度，共同决定每个请求的行为：
