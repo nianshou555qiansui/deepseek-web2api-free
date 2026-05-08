@@ -22,6 +22,13 @@ from tool_dsml import (
     build_dsml_tool_prompt,
 )
 from tool_sieve import StreamSieve, SieveEvent
+from anthropic_format import (
+    AnthropicRequest,
+    build_anthropic_prompt,
+    build_nonstream_response,
+    stream_response,
+    _msg_id,
+)
 
 load_dotenv()
 
@@ -286,6 +293,110 @@ async def chat_completions(req: ChatCompletionRequest):
         return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search)
 
     return _handle_nonstream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search)
+
+
+# ---- Anthropic /v1/messages endpoint ----
+
+
+@app.post("/v1/messages")
+async def messages(req: AnthropicRequest):
+    proxy_id = _msg_id()
+    system_str = req.system
+    if isinstance(system_str, list):
+        system_str = " ".join(
+            b.text for b in system_str if b.type == "text" and b.text
+        )
+
+    tools_dict = [t.model_dump() for t in req.tools] if req.tools else None
+    prompt = build_anthropic_prompt(
+        [m.model_dump() for m in req.messages],
+        tools=tools_dict,
+        system_str=system_str,
+    )
+
+    # MODE controls model_type
+    if MODE == "expert":
+        model_type = "expert"
+    else:
+        model_type = "default"
+
+    # THINKING — Anthropic thinking param maps to thinking_mode
+    if THINKING == "enabled":
+        thinking = True
+    elif THINKING == "disabled":
+        thinking = False
+    else:
+        thinking = (req.thinking is not None and req.thinking.type == "enabled") or False
+
+    # SEARCH
+    if SEARCH == "enabled":
+        search = True
+    elif SEARCH == "disabled":
+        search = False
+    else:
+        search = False
+
+    tool_names = []
+    if req.tools:
+        for t in req.tools:
+            if t.name:
+                tool_names.append(t.name)
+
+    if req.stream:
+        return await _anthropic_stream(proxy_id, prompt, tool_names,
+                                       model_type=model_type, thinking_mode=thinking,
+                                       search_enabled=search)
+
+    return _anthropic_nonstream(proxy_id, prompt, tool_names,
+                                model_type=model_type, thinking_mode=thinking,
+                                search_enabled=search)
+
+
+def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
+                         model_type: str | None = None,
+                         thinking_mode: bool = False, search_enabled: bool = False):
+    sid = _get_session()
+    ds_id = _get_ds_session(sid)
+    content = adapter.chat(ds_id, prompt, model_type=model_type,
+                           thinking_enabled=thinking_mode, search_enabled=search_enabled)
+
+    tool_calls, cleaned = parse_dsml_tool_calls(content, tool_names)
+    return build_nonstream_response(
+        msg_id, MODEL_NAME,
+        content_text=cleaned or content,
+        tool_calls=tool_calls,
+    )
+
+
+async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
+                            model_type: str | None = None,
+                            thinking_mode: bool = False, search_enabled: bool = False):
+    sid = _get_session()
+    ds_id = _get_ds_session(sid)
+
+    async def event_stream():
+        for event in stream_response(
+            msg_id, MODEL_NAME,
+            adapter.chat_stream(ds_id, prompt,
+                                model_type=model_type,
+                                thinking_enabled=thinking_mode,
+                                search_enabled=search_enabled),
+            tool_names,
+            thinking_mode=thinking_mode,
+        ):
+            yield event
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ---- OpenAI handlers ----
 
 
 def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = None,
