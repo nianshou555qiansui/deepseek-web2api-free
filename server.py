@@ -28,6 +28,7 @@ load_dotenv()
 MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-chat")
 MODE = os.environ.get("MODE", "auto").strip().lower()
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
+PORT = int(os.environ.get("PORT", "8080"))
 
 app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.1.0-pre")
 adapter = DeepSeekAdapter(token=TOKEN, cookies=COOKIES)
@@ -428,4 +429,4 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
 
 
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=8080, reload=False)
+    uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=False)
