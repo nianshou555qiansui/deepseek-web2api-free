@@ -28,6 +28,7 @@ load_dotenv()
 MODEL_NAME = os.environ.get("MODEL_NAME", "deepseek-chat")
 MODE = os.environ.get("MODE", "auto").strip().lower()
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
+SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
 PORT = int(os.environ.get("PORT", "8080"))
 
 app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.1.0-pre")
@@ -273,9 +274,13 @@ async def chat_completions(req: ChatCompletionRequest):
     else:
         thinking = req.thinking_mode or False
 
-    search = req.search_enabled or False
-
-    search = req.search_enabled or False
+    # SEARCH controls search_enabled independently
+    if SEARCH == "enabled":
+        search = True
+    elif SEARCH == "disabled":
+        search = False
+    else:
+        search = req.search_enabled or False
 
     if req.stream:
         return await _handle_stream(proxy_id, prompt, req.tools, model_type=model_type, thinking_mode=thinking, search_enabled=search)
