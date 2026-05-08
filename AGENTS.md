@@ -16,13 +16,14 @@
 8. [工具调用 (DSML)](#8-工具调用-dsml)
 9. [StreamSieve 流式筛分引擎](#9-streamsieve-流式筛分引擎)
 10. [OpenAI 兼容层](#10-openai-兼容层)
-11. [多轮对话与消息组装](#11-多轮对话与消息组装)
-12. [ContentPart 支持](#12-contentpart-支持)
-13. [配置系统](#13-配置系统)
-14. [关键算法细节](#14-关键算法细节)
-15. [已知限制与边界情况](#15-已知限制与边界情况)
-16. [常见调试方法](#16-常见调试方法)
-17. [协议变更预警](#17-协议变更预警)
+11. [Anthropic 兼容层](#11-anthropic-兼容层)
+12. [多轮对话与消息组装](#12-多轮对话与消息组装)
+13. [ContentPart 支持](#13-contentpart-支持)
+14. [配置系统](#14-配置系统)
+15. [关键算法细节](#14-关键算法细节)
+16. [已知限制与边界情况](#15-已知限制与边界情况)
+17. [常见调试方法](#16-常见调试方法)
+18. [协议变更预警](#17-协议变更预警)
 
 ---
 
@@ -42,7 +43,8 @@
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | OpenAI 兼容接口 | ✅ | `/v1/chat/completions`, `/v1/models`, `/health` |
-| 流式输出 (SSE) | ✅ | OpenAI chunk 格式 |
+| Anthropic 兼容接口 | ✅ | `/v1/messages` — Anthropic Claude API 格式 |
+| 流式输出 (SSE) | ✅ | OpenAI chunk 格式 + Anthropic SSE 格式 |
 | 非流式输出 | ✅ | 完整响应 |
 | 多轮对话 | ✅ | 客户端通过 messages 数组管理上下文 |
 | 普通对话 | ✅ | 快速模式 |
@@ -71,6 +73,7 @@
 D:\the llaa\DS反代 --pre\
 ├── server.py              # FastAPI 服务入口（路由、请求模型、SSE 组装）
 ├── adapter.py             # DeepSeek API 适配器（PoW、会话、SSE 解析）
+├── anthropic_format.py    # Anthropic /v1/messages 格式转换层
 ├── tool_dsml.py           # DSML 格式解析器（工具调用协议）
 ├── tool_sieve.py          # 流式筛分引擎（实时检测工具调用标签）
 ├── sha3_wasm_bg.wasm      # PoW 哈希引擎 WASM 二进制
@@ -89,11 +92,12 @@ D:\the llaa\DS反代 --pre\
 | 文件 | 职责 | 不负责 |
 |------|------|--------|
 | `server.py` | HTTP 路由、请求/响应模型、OpenAI 格式组装、工具调用协调 | PoW 求解、原生 SSE 解析 |
-| `adapter.py` | 与 DeepSeek API 通信、PoW 求解、SSE 流解析、会话创建 | HTTP 路由、OpenAI 格式 |
+| `adapter.py` | 与 DeepSeek API 通信、PoW 求解、SSE 流解析、会话创建 | HTTP 路由、OpenAI/Anthropic 格式 |
+| `anthropic_format.py` | Anthropic `/v1/messages` 请求解析、响应组装、SSE 生成 | DeepSeek 协议、HTTP 路由 |
 | `tool_dsml.py` | DSML XML 解析与生成、工具提示词构建 | 流式检测、HTTP |
 | `tool_sieve.py` | 流式文本中实时检测 DSML 工具调用标签 | 协议解析、HTTP |
 
-**核心原则：** `adapter.py` 的输出是"裸 token 流"（str 或 dict），`server.py` 负责包装成 OpenAI 格式。`adapter.py` 不知道 OpenAI 的存在。
+**核心原则：** `adapter.py` 的输出是"裸 token 流"（str 或 dict），`server.py` 和 `anthropic_format.py` 分别负责包装成特定 API 格式。`adapter.py` 不知道任何 API 格式的存在。
 
 #### 辅助文件
 
@@ -1348,7 +1352,147 @@ data: [DONE]
 
 ---
 
-## 11. 多轮对话与消息组装
+## 11. Anthropic 兼容层
+
+### 11.1 概述
+
+项目新增对 Anthropic Claude API 格式的支持，通过 `POST /v1/messages` 端点提供。
+
+**设计原则：** adapter 层完全不变。格式转换在独立模块 `anthropic_format.py` 中完成，与 OpenAI 逻辑隔离。
+
+### 11.2 端点
+
+| 端点 | 方法 | 功能 |
+|------|------|------|
+| `/v1/messages` | POST | Anthropic 格式对话补全 |
+
+### 11.3 请求映射
+
+| Anthropic 字段 | 映射方式 |
+|---------------|---------|
+| `messages[].content` | 提取文本 → `build_anthropic_prompt()` 拼入 prompt |
+| `system` | 拼入 prompt 开头作为 System 前缀 |
+| `thinking.type` | 映射为 `thinking_mode`，受 THINKING env 覆盖 |
+| `tools` | 转为 DSML 工具提示词注入（复用 `build_dsml_tool_prompt()`） |
+| `max_tokens` | 忽略（DeepSeek 不支持） |
+| `metadata` | 忽略 |
+| `stop_sequences` | 忽略 |
+| `stream` | 控制流式/非流式路径 |
+
+### 11.4 流式 SSE 格式
+
+Anthropic 使用独立的事件类型：
+
+```
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_...","type":"message","role":"assistant","content":[],...}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"推理过程..."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"最终回答"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},...}
+
+event: message_stop
+data: {"type":"message_stop"}
+```
+
+工具调用时：
+```
+content_block_start(index, type="tool_use", id="toolu_...", name="get_weather", input={})
+content_block_delta(index, type="input_json_delta", partial_json="...")
+content_block_stop(index)
+message_delta → stop_reason: "tool_use"
+```
+
+### 11.5 非流式响应
+
+Anthropic 格式使用 `content` 数组替代 OpenAI 的单一 `content` 字符串：
+
+```json
+{
+  "id": "msg_...",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {"type": "text", "text": "回答内容"}
+  ],
+  "model": "deepseek-chat",
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {"input_tokens": -1, "output_tokens": -1}
+}
+```
+
+有工具调用时：
+```json
+"content": [
+  {"type": "tool_use", "id": "toolu_xxx", "name": "get_weather", "input": {"city": "北京"}}
+],
+"stop_reason": "tool_use"
+```
+
+有 thinking 时（仅流式场景，非流式 adapter.chat() 不返回 thinking）：
+```json
+"content": [
+  {"type": "thinking", "thinking": "推理过程..."},
+  {"type": "text", "text": "回答内容"}
+]
+```
+
+### 11.6 工具调用映射
+
+Anthropic 使用 `tool_use`/`tool_result` content block 类型，与 OpenAI 的 `tool_calls`/`tool` role 对应：
+
+| OpenAI | Anthropic |
+|--------|-----------|
+| `tool_calls[].function.name` | `tool_use.name` |
+| `tool_calls[].function.arguments` (JSON string) | `tool_use.input` (parsed object) |
+| `tool_calls[].id` | `tool_use.id` (prefix: `toolu_`) |
+| `role: "tool"` + `tool_call_id` | `role: "user"` + `tool_result` block |
+
+`build_anthropic_prompt()` 将多轮对话中的 `tool_use` 块转为 DSML 格式 + `tool_result` 块转为 `Tool result:` 前缀。
+
+### 11.7 关键实现
+
+`anthropic_format.py` 的核心函数：
+
+| 函数 | 职责 |
+|------|------|
+| `build_anthropic_prompt()` | Anthropic messages → 内部 prompt 文本 |
+| `build_nonstream_response()` | token 流 → Anthropic 非流式 JSON |
+| `stream_response()` | token 流 → Anthropic SSE 事件生成器 |
+| `_dsml_toolcalls_to_anthropic()` | OpenAI tool_calls → Anthropic tool_use blocks |
+| `_emit_tool_use_blocks()` | tool_use → SSE content_block_start/delta/stop 事件 |
+
+### 11.8 MODE/THINKING/SEARCH 交互
+
+与 OpenAI 端点共享 MODE/THINKING/SEARCH 环境变量：
+
+```
+THINKING=enabled  → 强制 thinking=true（无视请求中 thinking 参数）
+THINKING=disabled → 强制 thinking=false
+THINKING=auto     → thinking = (请求中 thinking.type == "enabled")
+```
+
+---
+
+## 12. 多轮对话与消息组装
 
 ### 11.1 `_build_prompt()`
 
@@ -1377,7 +1521,7 @@ User: 那湿度呢？
 
 ---
 
-## 12. ContentPart 支持
+## 13. ContentPart 支持
 
 ### 12.1 解决的问题
 
@@ -1413,7 +1557,7 @@ class ContentPart(BaseModel):
 
 ---
 
-## 13. 配置系统
+## 14. 配置系统
 
 ### 13.1 环境变量
 
@@ -1579,7 +1723,7 @@ for /d /r . %d in (__pycache__) do @if exist "%d" rd /s /q "%d"
 
 
 
-## 14. 关键算法细节
+## 15. 关键算法细节
 
 ### 14.1 PoW Token 构造
 
@@ -1741,7 +1885,7 @@ yield "data: [DONE]\n\n"
 
 ---
 
-## 15. 已知限制与边界情况
+## 16. 已知限制与边界情况
 
 ### 15.1 认证相关
 
@@ -1850,7 +1994,7 @@ THINKING = os.environ.get("THINKING", "auto").strip().lower()
 这意味着**修改 `.env` 后必须重启服务器**才能生效。仅保存文件不会触发重新加载。使用 `--reload` 模式时 uvicorn 会检测文件变更然后重启，但 `.env` 变更不在 uvicorn 的文件监控范围内——需要手动重启。
 
 
-## 16. 常见调试方法
+## 17. 常见调试方法
 
 ### 16.1 测试 PoW 和基本连接
 
@@ -1986,7 +2130,7 @@ for entry in har["log"]["entries"]:
 
 ---
 
-## 17. 协议变更预警
+## 18. 协议变更预警
 
 以下因素可能导致项目失效，需要及时更新：
 
