@@ -6,16 +6,19 @@ import json
 import os
 import time
 import uuid
-import asyncio
 from typing import Optional, Union, Any
 
 import uvicorn
 from dotenv import load_dotenv
+import os as _os
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from adapter import DeepSeekAdapter, TOKEN, COOKIES
+from adapter import DeepSeekAdapter
+from admin import router as admin_router, get_pool, get_stats
 from tool_dsml import (
     parse_dsml_tool_calls,
     format_tool_calls_for_prompt,
@@ -39,10 +42,10 @@ SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
 PORT = int(os.environ.get("PORT", "8080"))
 
 app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.1.0-pre")
-adapter = DeepSeekAdapter(token=TOKEN, cookies=COOKIES)
+pool = get_pool()
 
-# In-memory session store
-_sessions: dict[str, str] = {}
+if pool.count() == 0:
+    print("WARNING: No accounts in pool. Set DEEPSEEK_TOKEN and DEEPSEEK_COOKIES in .env")
 
 
 # ---- Pydantic models ----
@@ -107,20 +110,35 @@ class ModelList(BaseModel):
     data: list[ModelInfo]
 
 
-# ---- Session helpers ----
+# ---- Account pool helpers ----
 
-def _get_session() -> str:
-    sid = str(uuid.uuid4())
-    ds_session = adapter.create_session()
-    _sessions[sid] = ds_session
-    return sid
+class AcquiredAccount:
+    """Context manager wrapping an acquired pool account."""
+    def __init__(self, acct):
+        self.acct = acct
+        self.adapter = acct.adapter
+        self._session_id: str | None = None
+
+    def create_session(self) -> str:
+        ds_id = self.adapter.create_session()
+        self._session_id = ds_id
+        return ds_id
+
+    @property
+    def session_id(self) -> str:
+        if self._session_id is None:
+            raise RuntimeError("No session created")
+        return self._session_id
+
+    def release(self):
+        pool.release(self.acct)
 
 
-def _get_ds_session(proxy_sid: str) -> str:
-    ds = _sessions.get(proxy_sid)
-    if ds is None:
-        raise HTTPException(status_code=400, detail="Session not found")
-    return ds
+def _acquire() -> AcquiredAccount:
+    acct = pool.acquire()
+    if acct is None:
+        raise HTTPException(status_code=503, detail="All accounts busy, try again later")
+    return AcquiredAccount(acct)
 
 
 # ---- Message / prompt building ----
@@ -355,10 +373,19 @@ async def messages(req: AnthropicRequest):
 def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
                          model_type: str | None = None,
                          thinking_mode: bool = False, search_enabled: bool = False):
-    sid = _get_session()
-    ds_id = _get_ds_session(sid)
-    content = adapter.chat(ds_id, prompt, model_type=model_type,
-                           thinking_enabled=thinking_mode, search_enabled=search_enabled)
+    acq = _acquire()
+    try:
+        ds_id = acq.create_session()
+        t0 = time.time()
+        content = acq.adapter.chat(ds_id, prompt, model_type=model_type,
+                                    thinking_enabled=thinking_mode, search_enabled=search_enabled)
+        lat = (time.time() - t0) * 1000
+        get_stats().record(MODEL_NAME, lat)
+    except Exception as e:
+        get_stats().record(MODEL_NAME, 0, success=False)
+        raise
+    finally:
+        acq.release()
 
     tool_calls, cleaned = parse_dsml_tool_calls(content, tool_names)
     return build_nonstream_response(
@@ -371,20 +398,29 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
 async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                             model_type: str | None = None,
                             thinking_mode: bool = False, search_enabled: bool = False):
-    sid = _get_session()
-    ds_id = _get_ds_session(sid)
+    acq = _acquire()
+    ds_id = acq.create_session()
+    t0 = time.time()
 
     async def event_stream():
-        for event in stream_response(
-            msg_id, MODEL_NAME,
-            adapter.chat_stream(ds_id, prompt,
-                                model_type=model_type,
-                                thinking_enabled=thinking_mode,
-                                search_enabled=search_enabled),
-            tool_names,
-            thinking_mode=thinking_mode,
-        ):
-            yield event
+        nonlocal t0
+        try:
+            for event in stream_response(
+                msg_id, MODEL_NAME,
+                acq.adapter.chat_stream(ds_id, prompt,
+                                       model_type=model_type,
+                                       thinking_enabled=thinking_mode,
+                                       search_enabled=search_enabled),
+                tool_names,
+                thinking_mode=thinking_mode,
+            ):
+                yield event
+            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
+        except Exception:
+            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False)
+            raise
+        finally:
+            acq.release()
 
     return StreamingResponse(
         event_stream(),
@@ -403,10 +439,18 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
                       model_type: str | None = None,
                       thinking_mode: bool = False, search_enabled: bool = False):
     """Non-streaming completion with tool call detection."""
-    sid = _get_session()
-    ds_id = _get_ds_session(sid)
-    content = adapter.chat(ds_id, prompt, model_type=model_type,
-                           thinking_enabled=thinking_mode, search_enabled=search_enabled)
+    acq = _acquire()
+    try:
+        ds_id = acq.create_session()
+        t0 = time.time()
+        content = acq.adapter.chat(ds_id, prompt, model_type=model_type,
+                                    thinking_enabled=thinking_mode, search_enabled=search_enabled)
+        get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
+    except Exception as e:
+        get_stats().record(MODEL_NAME, 0, success=False)
+        raise
+    finally:
+        acq.release()
 
     tool_names = _get_tool_names(tools)
     tool_calls, cleaned = _parse_response_for_tools(content, tool_names)
@@ -450,89 +494,94 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                          model_type: str | None = None,
                          thinking_mode: bool = False, search_enabled: bool = False):
     """Streaming completion with StreamSieve tool call detection and expert mode support."""
-    sid = _get_session()
-    ds_id = _get_ds_session(sid)
+    acq = _acquire()
+    ds_id = acq.create_session()
     tool_names = _get_tool_names(tools)
+    t0 = time.time()
 
     async def event_stream():
-        yield _openai_chunk(proxy_id, finish=False)
-        role_sent = False
+        nonlocal t0
+        try:
+            yield _openai_chunk(proxy_id, finish=False)
+            role_sent = False
 
-        def _parse_fn(text):
-            return parse_dsml_tool_calls(text, tool_names)
+            def _parse_fn(text):
+                return parse_dsml_tool_calls(text, tool_names)
 
-        sieve = StreamSieve(parse_fn=_parse_fn)
-        full_buf = ""
+            sieve = StreamSieve(parse_fn=_parse_fn)
+            full_buf = ""
 
-        for token in adapter.chat_stream(ds_id, prompt,
-                                          model_type=model_type,
-                                          thinking_enabled=thinking_mode,
-                                          search_enabled=search_enabled):
-            if isinstance(token, dict):
-                tt = token.get("__type")
-                if tt == "status":
-                    if token["status"] == "FINISHED":
-                        break
-                    continue
-                elif tt == "thinking":
-                    # Emit reasoning_content for thinking tokens
-                    content = token.get("content", "")
-                    if content:
-                        if not role_sent:
-                            yield _openai_chunk(proxy_id, reasoning_content="")
-                            role_sent = True
-                        yield _openai_chunk(proxy_id, reasoning_content=content)
-                    continue
-
-            # Normal text token (str) — feed to sieve
-            full_buf += token
-            for evt in sieve.feed(token):
-                if evt.type == "text":
-                    if evt.data:
-                        if not role_sent:
-                            if thinking_mode:
+            for token in acq.adapter.chat_stream(ds_id, prompt,
+                                                  model_type=model_type,
+                                                  thinking_enabled=thinking_mode,
+                                                  search_enabled=search_enabled):
+                if isinstance(token, dict):
+                    tt = token.get("__type")
+                    if tt == "status":
+                        if token["status"] == "FINISHED":
+                            break
+                        continue
+                    elif tt == "thinking":
+                        content = token.get("content", "")
+                        if content:
+                            if not role_sent:
                                 yield _openai_chunk(proxy_id, reasoning_content="")
-                            role_sent = True
-                        yield _openai_chunk(proxy_id, content=evt.data)
+                                role_sent = True
+                            yield _openai_chunk(proxy_id, reasoning_content=content)
+                        continue
+
+                # Normal text token (str) — feed to sieve
+                full_buf += token
+                for evt in sieve.feed(token):
+                    if evt.type == "text":
+                        if evt.data:
+                            if not role_sent:
+                                if thinking_mode:
+                                    yield _openai_chunk(proxy_id, reasoning_content="")
+                                role_sent = True
+                            yield _openai_chunk(proxy_id, content=evt.data)
+                    elif evt.type == "tool_calls":
+                        for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
+                            yield chunk
+                        yield "data: [DONE]\n\n"
+                        return
+
+            # Flush sieve
+            had_tool = False
+            for evt in sieve.flush():
+                if evt.type == "text" and evt.data:
+                    if not role_sent:
+                        if thinking_mode:
+                            yield _openai_chunk(proxy_id, reasoning_content="")
+                        role_sent = True
+                    yield _openai_chunk(proxy_id, content=evt.data)
                 elif evt.type == "tool_calls":
+                    had_tool = True
                     for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
+                        yield chunk
+
+            if had_tool:
+                yield "data: [DONE]\n\n"
+                return
+
+            # Fallback: parse full buffer
+            if not had_tool and full_buf:
+                tc_result, _ = parse_dsml_tool_calls(full_buf, tool_names)
+                if tc_result:
+                    if not role_sent:
+                        if thinking_mode:
+                            yield _openai_chunk(proxy_id, reasoning_content="")
+                        role_sent = True
+                    for chunk in _emit_tool_calls_chunks(tc_result, proxy_id):
                         yield chunk
                     yield "data: [DONE]\n\n"
                     return
 
-        # Flush sieve
-        had_tool = False
-        for evt in sieve.flush():
-            if evt.type == "text" and evt.data:
-                if not role_sent:
-                    if thinking_mode:
-                        yield _openai_chunk(proxy_id, reasoning_content="")
-                    role_sent = True
-                yield _openai_chunk(proxy_id, content=evt.data)
-            elif evt.type == "tool_calls":
-                had_tool = True
-                for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
-                    yield chunk
-
-        if had_tool:
+            yield _openai_chunk(proxy_id, finish=True)
             yield "data: [DONE]\n\n"
-            return
-
-        # Fallback: sieve 没抓到，全量重试
-        if not had_tool and full_buf:
-            tc_result, _ = parse_dsml_tool_calls(full_buf, tool_names)
-            if tc_result:
-                if not role_sent:
-                    if thinking_mode:
-                        yield _openai_chunk(proxy_id, reasoning_content="")
-                    role_sent = True
-                for chunk in _emit_tool_calls_chunks(tc_result, proxy_id):
-                    yield chunk
-                yield "data: [DONE]\n\n"
-                return
-
-        yield _openai_chunk(proxy_id, finish=True)
-        yield "data: [DONE]\n\n"
+        finally:
+            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
+            acq.release()
 
     return StreamingResponse(
         event_stream(),
@@ -543,6 +592,30 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
         },
     )
 
+
+# ── Admin & static file serving ──────────────────────────────
+
+_WEBUI_DIR = _os.path.join(_os.path.dirname(__file__), "webui")
+
+app.include_router(admin_router)
+
+if _os.path.isdir(_WEBUI_DIR):
+    @app.get("/webui/{rest_of_path:path}")
+    async def webui_spa(rest_of_path: str):
+        file_path = _os.path.join(_WEBUI_DIR, rest_of_path) if rest_of_path else _WEBUI_DIR
+        if _os.path.isfile(file_path):
+            return FileResponse(file_path)
+        index = _os.path.join(_WEBUI_DIR, "index.html")
+        if _os.path.isfile(index):
+            return FileResponse(index)
+        return {"error": "webui not built"}
+
+    @app.get("/webui")
+    async def webui_root():
+        index = _os.path.join(_WEBUI_DIR, "index.html")
+        if _os.path.isfile(index):
+            return FileResponse(index)
+        return {"error": "webui not built"}
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=False)
