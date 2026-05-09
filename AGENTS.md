@@ -20,10 +20,12 @@
 12. [多轮对话与消息组装](#12-多轮对话与消息组装)
 13. [ContentPart 支持](#13-contentpart-支持)
 14. [配置系统](#14-配置系统)
-15. [关键算法细节](#14-关键算法细节)
-16. [已知限制与边界情况](#15-已知限制与边界情况)
-17. [常见调试方法](#16-常见调试方法)
-18. [协议变更预警](#17-协议变更预警)
+15. [账号池 (AccountPool)](#15-账号池-accountpool)
+16. [管理后台 (Admin API)](#16-管理后台-admin-api)
+17. [关键算法细节](#17-关键算法细节)
+18. [已知限制与边界情况](#18-已知限制与边界情况)
+19. [常见调试方法](#19-常见调试方法)
+20. [协议变更预警](#20-协议变更预警)
 
 ---
 
@@ -74,10 +76,16 @@ D:\the llaa\DS反代 --pre\
 ├── server.py              # FastAPI 服务入口（路由、请求模型、SSE 组装）
 ├── adapter.py             # DeepSeek API 适配器（PoW、会话、SSE 解析）
 ├── anthropic_format.py    # Anthropic /v1/messages 格式转换层
+├── account_pool.py        # 多账号池管理（CRUD、状态追踪、轮询分配、健康检查）
+├── admin.py               # 管理后台 API（密码认证、请求统计、账号池管理）
 ├── tool_dsml.py           # DSML 格式解析器（工具调用协议）
 ├── tool_sieve.py          # 流式筛分引擎（实时检测工具调用标签）
 ├── sha3_wasm_bg.wasm      # PoW 哈希引擎 WASM 二进制
 ├── start.bat              # Windows 一键启动脚本
+├── webui/                 # 管理面板前端（纯静态 SPA，零 build 依赖）
+│   ├── index.html
+│   ├── app.js
+│   └── style.css
 ├── .env                   # 环境配置（含 TOKEN/COOKIE，不提交）
 ├── .env.example           # 配置模板（提交到仓库）
 ├── requirements.txt       # Python 依赖
@@ -94,6 +102,8 @@ D:\the llaa\DS反代 --pre\
 | `server.py` | HTTP 路由、请求/响应模型、OpenAI 格式组装、工具调用协调 | PoW 求解、原生 SSE 解析 |
 | `adapter.py` | 与 DeepSeek API 通信、PoW 求解、SSE 流解析、会话创建 | HTTP 路由、OpenAI/Anthropic 格式 |
 | `anthropic_format.py` | Anthropic `/v1/messages` 请求解析、响应组装、SSE 生成 | DeepSeek 协议、HTTP 路由 |
+| `account_pool.py` | 多账号 CRUD、状态追踪（idle/busy/error）、轮询分配、健康检查/重登录 | HTTP 路由、DeepSeek 协议 |
+| `admin.py` | 管理后台 API 端点（密码认证、统计查询、账号池 CRUD、重登录触发） | 前端渲染、DeepSeek 协议 |
 | `tool_dsml.py` | DSML XML 解析与生成、工具提示词构建 | 流式检测、HTTP |
 | `tool_sieve.py` | 流式文本中实时检测 DSML 工具调用标签 | 协议解析、HTTP |
 
@@ -105,6 +115,7 @@ D:\the llaa\DS反代 --pre\
 |------|------|
 | `sha3_wasm_bg.wasm` | PoW 哈希引擎 WASM 二进制，从 DeepSeek 前端 JavaScript 中提取。通过 `wasmtime` 加载，导出 `wasm_solve` 等函数。版本与 DeepSeek 前端发布绑定。 |
 | `start.bat` | Windows 一键启动脚本。自动检测并释放 `PORT` 环境变量指定的端口（默认 8080），然后启动 uvicorn。如果端口被其他进程占用，会先强制终止该进程及其子进程。 |
+| `webui/` | 管理面板前端（纯静态 SPA）。包含 `index.html`、`app.js`、`style.css`。零 npm/build 依赖，通过 FastAPI 静态文件挂载在 `/webui/` 路径。 |
 | `requirements.txt` | Python 依赖声明。关键依赖版本要求见下表。 |
 | `.env.example` | 环境配置模板。复制为 `.env` 后填入凭证。提交到仓库但不含敏感信息。 |
 
@@ -144,7 +155,7 @@ curl http://localhost:8080/health
 ```bash
 uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080} --reload
 ```
-`--reload` 会在文件变更时自动重启，但注意它不会自动清理 `__pycache__`（见 §15.5）。
+`--reload` 会在文件变更时自动重启，但注意它不会自动清理 `__pycache__`（见 §18.5）。
 
 ### 2.3 预览版 vs 开源版差异
 
@@ -1721,11 +1732,134 @@ for /d /r . %d in (__pycache__) do @if exist "%d" rd /s /q "%d"
 
 ---
 
+## 15. 账号池 (AccountPool)
 
+### 18.1 设计目标
 
-## 15. 关键算法细节
+支持多 DeepSeek 账号轮询使用，解决单账号被限流/封禁时的 failover 问题。`AccountPool` 管理账号的完整生命周期：添加、分配、释放、错误标记和健康检查。
 
-### 14.1 PoW Token 构造
+### 18.2 核心数据结构
+
+```python
+@dataclass
+class Account:
+    token: str            # DeepSeek Bearer Token
+    cookies: str          # DeepSeek Cookie
+    email: str            # 显示用标识
+    state: str            # idle | busy | error
+    error_count: int
+    last_error: str
+    last_used: float
+```
+
+### 18.3 状态流转
+
+```
+添加 → idle
+        │
+   acquire() → busy → release() → idle
+        │                │
+        │  mark_error()  ↓
+        └────────→ error ──→ relogin() (成功 → idle, 失败 → error)
+```
+
+### 18.4 轮询分配
+
+`acquire()` 使用 round-robin 策略遍历账号列表，返回第一个 `idle` 状态的账号并将其标记为 `busy`。如果所有账号均 busy，返回 `None`，server.py 返回 HTTP 503。
+
+### 18.5 健康检查与重登录
+
+```python
+def check_health(acct) -> bool:
+    """通过创建 DeepSeek 会话来验证凭证有效性。"""
+```
+
+`relogin(index)` 对 `error` 状态的账号执行健康检查：成功则重置为 `idle`，失败保留 `error` 状态并更新 `last_error`。
+
+### 15.6 线程安全
+
+`AccountPool` 使用 `threading.Lock` 保护所有状态变更操作（CRUD、状态切换）。`_WASMSolver` 已有独立锁，两把锁不会形成死锁（无嵌套加锁）。
+
+### 15.7 初始加载
+
+启动时从 `DEEPSEEK_TOKEN` / `DEEPSEEK_COOKIES` 环境变量加载默认账号，适用于单账号场景。多账号通过管理面板或 Admin API 添加。
+
+---
+
+## 16. 管理后台 (Admin API)
+
+### 19.1 设计概述
+
+管理后台包含三个部分：
+1. **Admin API** (`admin.py`) — FastAPI APIRouter，挂载在 `/admin/api` 前缀
+2. **AccountPool** (`account_pool.py`) — 账号池核心逻辑
+3. **前端 SPA** (`webui/`) — 纯静态 HTML/CSS/JS，通过 FastAPI 挂载在 `/webui/`
+
+所有管理 API 端点（除 `/admin/api/login`）均需要 Bearer Token 认证。
+
+### 19.2 API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/admin/api/login` | 密码登录，返回 token |
+| `GET` | `/admin/api/stats` | 请求统计（总量/成功/失败/平均延迟/tokens/运行时长） |
+| `GET` | `/admin/api/accounts` | 账号列表 + 池状态汇总（total/idle/busy/error） |
+| `POST` | `/admin/api/accounts` | 添加账号（body: token, cookies, email） |
+| `DELETE` | `/admin/api/accounts/{index}` | 删除账号 |
+| `POST` | `/admin/api/accounts/{index}/relogin` | 重登录 error 账号 |
+
+### 19.3 认证机制
+
+- 管理密码设置：`DEEPSEEK_ADMIN_PASSWORD` 环境变量（默认 `admin`）
+- Token 存储：服务端内存 `set`，每次登录生成 64 位 hex token
+- Token 验证：每次请求从 `Authorization: Bearer <token>` 头提取
+- 无过期机制（服务重启后需重新登录）
+
+### 16.4 请求统计
+
+`StatsSnapshot` 在内存中维护以下计数器：
+- `total_requests` / `success_requests` / `failed_requests`
+- `total_latency_ms`（累加后计算平均值）
+- `total_prompt_tokens` / `total_completion_tokens`
+- 按模型聚合：`models[model_name] = {requests, prompt_tokens, completion_tokens}`
+
+统计在 `chat()`/`chat_stream()` 调用前后通过 `get_stats().record()` 记录。流式响应在 `finally` 块中确保统计被记录。
+
+### 16.5 前端 SPA
+
+- **路由**：`/webui/` → `index.html`，Hash 路由（`#dashboard` / `#accounts`）
+- **技术栈**：纯 HTML + CSS + JavaScript，无 npm/build 依赖
+- **主题**：暗色主题（CSS 自定义属性），蓝色主色调
+- **页面**：
+  - 登录页 → 输入密码 → POST `/admin/api/login` → 保存 token
+  - 概览页 → 请求统计卡片 + 账号池状态一览（含账号 badge）
+  - 账号池页 → 添加表单 + 账号列表表格（状态 badge / 重登录按钮 / 删除按钮）
+- **自动刷新**：概览页每 5s 轮询 `/admin/api/stats` 和 `/admin/api/accounts`，账号页手动刷新
+
+### 16.6 与 server.py 集成
+
+```python
+# server.py
+from admin import router as admin_router, get_pool, get_stats
+
+pool = get_pool()           # 共享的 AccountPool 实例
+
+# 在 handler 中使用 pool 获取账号
+acq = pool.acquire()        # 获取一个空闲账号（标记为 busy）
+# ... 使用 acq.adapter.chat_stream(...) ...
+pool.release(acq.acct)      # 释放（标记回 idle）
+
+# 请求完成后记录统计
+get_stats().record(model, latency_ms, prompt_tokens, completion_tokens)
+```
+
+---
+
+## 17. 关键算法细节
+
+### 20.1 PoW Token 构造
+
+### 20.1 PoW Token 构造
 
 ```python
 raw = json.dumps({
@@ -1741,7 +1875,7 @@ pow_token = base64.b64encode(raw.encode()).decode()
 
 注意 `separators=(",", ":")` 确保 JSON 无空白，这是 DeepSeek 服务端的期望格式。
 
-### 14.2 SSE 行解析
+### 17.2 SSE 行解析
 
 ```python
 for line in resp.iter_lines():
@@ -1762,7 +1896,7 @@ for line in resp.iter_lines():
 - `data:` 行后可能跟空字符串（跳过）
 - JSON 解析失败的行跳过（非关键路径）
 
-### 14.3 `_try_finish_capture` 完成判断
+### 17.3 `_try_finish_capture` 完成判断
 
 ```python
 def _is_capture_complete(self) -> bool:
@@ -1885,15 +2019,15 @@ yield "data: [DONE]\n\n"
 
 ---
 
-## 16. 已知限制与边界情况
+## 18. 已知限制与边界情况
 
-### 15.1 认证相关
+### 18.1 认证相关
 
 - **Token/Cookie 过期**：不定期失效，需重新获取。没有自动续期机制。
 - **多账号**：不支持，启动时从 `.env` 读取单组凭证。
 - **没有 API Key 校验**：`OPENAI_API_KEY` 参数被忽略（接受任意值）。
 
-### 15.2 功能限制
+### 18.2 功能限制
 
 | 限制 | 原因 | 影响 |
 |------|------|------|
@@ -1904,18 +2038,18 @@ yield "data: [DONE]\n\n"
 | 无多模态 | 网页 API 不支持图片 | 仅文本交互 |
 | THINK 内容在非流式模式不返回 | 当前实现仅收集 RESPONSE fragment | 非流式看不到推理过程 |
 
-### 15.3 稳定性
+### 18.3 稳定性
 
 - **WASM 求解失败**：罕见情况下求解超时或返回 0，需重试
 - **Session 创建失败**：PoW 过期或凭证失效
 - **SSE 断流**：长时间响应可能被 DeepSeek 中断
 - **DSML 解析失败**：模型输出格式不符合预期时，工具调用不生效
 
-### 15.4 边界情况处理
+### 18.4 边界情况处理
 
 **空消息列表：** `_build_prompt([])` 返回 `""`，DeepSeek 可能回复空或报错。
 
-### 15.5 陈旧字节码缓存 (`__pycache__`)
+### 18.5 陈旧字节码缓存 (`__pycache__`)
 
 Python 的 `__pycache__` 目录缓存编译后的字节码（`.pyc`）。当源文件被修改但缓存未刷新时，python server.py 可能运行旧版本代码。
 
@@ -1994,9 +2128,9 @@ THINKING = os.environ.get("THINKING", "auto").strip().lower()
 这意味着**修改 `.env` 后必须重启服务器**才能生效。仅保存文件不会触发重新加载。使用 `--reload` 模式时 uvicorn 会检测文件变更然后重启，但 `.env` 变更不在 uvicorn 的文件监控范围内——需要手动重启。
 
 
-## 17. 常见调试方法
+## 19. 常见调试方法
 
-### 16.1 测试 PoW 和基本连接
+### 19.1 测试 PoW 和基本连接
 
 ```python
 from adapter import DeepSeekAdapter, TOKEN, COOKIES
@@ -2007,14 +2141,14 @@ print(f"Session: {sid}")
 
 预期输出：`Session: <uuid>`。如失败检查凭证是否过期。
 
-### 16.2 测试快速模式
+### 19.2 测试快速模式
 
 ```python
 content = adapter.chat(sid, "User: 你好")
 print(f"Reply: {content}")
 ```
 
-### 16.3 测试专家模式
+### 19.3 测试专家模式
 
 ```python
 content = adapter.chat(sid, "User: 思考一个哲学问题",
@@ -2130,11 +2264,11 @@ for entry in har["log"]["entries"]:
 
 ---
 
-## 18. 协议变更预警
+## 20. 协议变更预警
 
 以下因素可能导致项目失效，需要及时更新：
 
-### 17.1 前端更新
+### 20.1 前端更新
 
 DeepSeek 前端更新可能改变：
 - API 端点路径（`/api/v0/chat/completion` → 其他）
