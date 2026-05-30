@@ -586,6 +586,12 @@ taskkill /F /IM python.exe
 python -m uvicorn server:app --host 0.0.0.0 --port 8080
 ```
 
+### Q: 浏览器插件（如 YouTube 字幕翻译）请求失败，日志显示 405 Method Not Allowed
+
+某些 Chrome 插件在使用 OpenAI 兼容接口前会先发送 `OPTIONS` 预检请求（CORS preflight）来检查服务器是否允许跨域访问。如果服务端未处理 `OPTIONS` 请求，会返回 `405 Method Not Allowed`，导致插件无法正常使用。
+
+**解决方法：** 本项目已内置 CORS 中间件（`CORSMiddleware`），默认允许所有来源、方法和请求头。如果仍遇到跨域问题，请确认版本已包含 `server.py` 中的 CORS 配置。
+
 ### Q: 支持多轮对话吗？
 
 不支持。每次请求都是独立的，服务器会创建新的 DeepSeek Chat 会话。多轮会话支持需要在应用层面（如 NextChat）维护上下文。

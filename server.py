@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from adapter import DeepSeekAdapter
@@ -42,6 +43,15 @@ SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
 PORT = int(os.environ.get("PORT", "8080"))
 
 app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.1.0-pre")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 pool = get_pool()
 
 if pool.count() == 0:

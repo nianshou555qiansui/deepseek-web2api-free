@@ -2038,18 +2038,34 @@ yield "data: [DONE]\n\n"
 | 无多模态 | 网页 API 不支持图片 | 仅文本交互 |
 | THINK 内容在非流式模式不返回 | 当前实现仅收集 RESPONSE fragment | 非流式看不到推理过程 |
 
-### 18.3 稳定性
+### 18.3 CORS 跨域支持
+
+项目使用 FastAPI 的 `CORSMiddleware` 处理跨域请求。配置位于 `server.py`：
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+**默认允许所有来源、方法和请求头。** 这解决了浏览器插件（如 YouTube 字幕翻译等 Chrome 扩展）在使用 OpenAI 兼容接口时因 CORS 预检请求（`OPTIONS`）失败的问题。如果部署在需要限制跨域访问的环境，可相应收紧 `allow_origins` 等参数。
+
+### 18.4 稳定性
 
 - **WASM 求解失败**：罕见情况下求解超时或返回 0，需重试
 - **Session 创建失败**：PoW 过期或凭证失效
 - **SSE 断流**：长时间响应可能被 DeepSeek 中断
 - **DSML 解析失败**：模型输出格式不符合预期时，工具调用不生效
 
-### 18.4 边界情况处理
+### 18.5 边界情况处理
 
 **空消息列表：** `_build_prompt([])` 返回 `""`，DeepSeek 可能回复空或报错。
 
-### 18.5 陈旧字节码缓存 (`__pycache__`)
+### 18.6 陈旧字节码缓存 (`__pycache__`)
 
 Python 的 `__pycache__` 目录缓存编译后的字节码（`.pyc`）。当源文件被修改但缓存未刷新时，python server.py 可能运行旧版本代码。
 
