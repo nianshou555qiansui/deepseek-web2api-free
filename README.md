@@ -2,7 +2,7 @@
 
 > 将 DeepSeek Chat (chat.deepseek.com) 的私有 API 转换为 OpenAI / Anthropic 兼容格式。
 
-> **🤖 全 AI 生成声明**: 本项目没有一行人工手写代码。所有的 API 端点设计、协议逆向、PoW 求解、SSE 解析、格式映射、文档编写等等全部由 **DeepSeek v4 Flash 模型** + **Claude Code** 协作完成。至于为什么用 Flash 版本？因为作者钱不够用，用不起 Pro 😅。但事实证明 Flash 版本非！常！好！—— 推理能力够强、响应速度够快、性价比拉满，猛猛夸！
+> **🤖 全 AI 生成声明**: 本项目没有一行人工手写代码。所有的 API 端点设计、协议逆向、PoW 求解、SSE 解析、格式映射、文档编写等等全部由 **DeepSeek v4 Flash 模型** + **Claude Code** 协作完成。
 
 **免责声明**: 本项目仅限学习研究使用。非官方项目，与 DeepSeek 无关。使用需自行承担风险，不保证稳定性。
 
