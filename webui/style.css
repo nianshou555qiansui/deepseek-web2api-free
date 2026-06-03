@@ -295,6 +295,10 @@ tr:last-child td { border-bottom: none; }
 }
 .btn-icon:hover { background: var(--bg-hover); color: var(--text); }
 .btn-icon.danger:hover { background: var(--red-bg); color: var(--red); }
+.btn:disabled, .btn-icon:disabled { opacity: .45; cursor: not-allowed; }
+.code-inline { font-family: "SF Mono", "JetBrains Mono", monospace; font-size: 12px; color: var(--text-dim); }
+.btn:disabled, .btn-icon:disabled { opacity: .45; cursor: not-allowed; }
+.code-inline { font-family: "SF Mono", "JetBrains Mono", monospace; font-size: 12px; color: var(--text-dim); }
 
 /* ── Toast ────────────────────────────────────────────────── */
 .toast {

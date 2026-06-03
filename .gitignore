@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 server_test.log
 venv/
+.venv/
+data/accounts.json
+.venv/
+data/accounts.json

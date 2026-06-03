@@ -2,6 +2,8 @@
 const STATE = {
   token: localStorage.getItem("ds_token") || null,
   view: "dashboard",
+  editingAccountId: null,
+  editingAccountEmail: "",
 };
 
 function setToken(t) { STATE.token = t; if (t) localStorage.setItem("ds_token", t); else localStorage.removeItem("ds_token"); }
@@ -54,6 +56,7 @@ const ICON = {
   x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
   logOut: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
   reload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
 };
 
 /* ── Render ───────────────────────────────────────────────── */
@@ -128,7 +131,7 @@ function attachLogin() {
       setToken(res.token);
       render();
     } catch (e) {
-      errDiv.innerHTML = `<div class="login-error">${e.message}</div>`;
+      errDiv.innerHTML = `<div class="login-error">${esc(e.message)}</div>`;
       btn.disabled = false;
       btn.innerHTML = `${ICON.login} 登录`;
     }
@@ -186,7 +189,7 @@ async function renderDashboard(el) {
       const badgesEl = document.getElementById("pool-badges");
       if (accts.accounts && accts.accounts.length) {
         badgesEl.innerHTML = accts.accounts.map(a =>
-          `<span class="badge ${a.state}">${esc(a.email)}</span>`
+          `<span class="badge ${escAttr(a.state)}">${esc(a.email || a.id)} · ${esc(a.source)}</span>`
         ).join("");
       } else {
         badgesEl.innerHTML = '<div class="empty">暂无账号</div>';
@@ -203,23 +206,25 @@ async function renderDashboard(el) {
 async function renderAccounts(el) {
   el.innerHTML = `<h1 class="page-title">${ICON.users} 账号池</h1>
     <div class="section">
-      <div class="section-header">添加账号</div>
+      <div class="section-header" id="acct-form-title">${STATE.editingAccountId ? '编辑账号' : '添加账号'}</div>
       <div class="section-body">
         <div class="form-row">
           <div class="form-group" style="flex:1;min-width:180px">
             <label>标识（邮箱/备注）</label>
-            <input class="input" id="acct-email" placeholder="例如 user@example.com">
+            <input class="input" id="acct-email" placeholder="例如 user@example.com" value="${escAttr(STATE.editingAccountEmail || '')}">
           </div>
           <div class="form-group" style="flex:2;min-width:240px">
             <label>Token</label>
-            <input class="input code" id="acct-token" placeholder="Bearer token">
+            <input class="input code" id="acct-token" placeholder="${STATE.editingAccountId ? '留空则不修改 Token' : 'Authorization Bearer token（不要带 Bearer）'}">
           </div>
           <div class="form-group" style="flex:2;min-width:240px">
             <label>Cookies</label>
-            <input class="input code" id="acct-cookies" placeholder="cf_clearance=...; session=...">
+            <input class="input code" id="acct-cookies" placeholder="${STATE.editingAccountId ? '留空则不修改 Cookies' : 'cf_clearance=...; session=...'}">
           </div>
-          <button class="btn btn-primary" id="acct-add-btn">${ICON.plus} 添加</button>
+          <button class="btn btn-primary" id="acct-save-btn">${STATE.editingAccountId ? ICON.edit + ' 保存' : ICON.plus + ' 添加'}</button>
+          <button class="btn btn-outline" id="acct-cancel-btn" style="${STATE.editingAccountId ? '' : 'display:none'}">取消</button>
         </div>
+        <div class="text-muted">面板添加的账号会持久保存；.env 账号会显示为只读，只能编辑 .env 后重启服务。</div>
       </div>
     </div>
     <div class="section">
@@ -237,70 +242,147 @@ async function renderAccounts(el) {
       const data = await api("/admin/api/accounts");
       const accounts = data.accounts || [];
       if (!accounts.length) {
-        wrap.innerHTML = '<div class="empty">暂无账号。从 .env 加载的默认账号显示在上面。</div>';
+        wrap.innerHTML = '<div class="empty">暂无账号。你可以从面板添加持久账号，或在 .env 中配置 DEEPSEEK_TOKEN_1/2...</div>';
         return;
       }
       wrap.innerHTML = `<table>
         <thead><tr>
           <th>标识</th>
+          <th>来源</th>
           <th>状态</th>
+          <th>Token</th>
+          <th>Cookies</th>
           <th>错误次数</th>
           <th>最后错误</th>
-          <th style="width:100px">操作</th>
+          <th style="width:170px">操作</th>
         </tr></thead>
-        <tbody>${accounts.map((a, i) => `<tr>
-          <td><span class="truncate" style="max-width:200px;display:inline-block">${esc(a.email)}</span></td>
-          <td><span class="badge ${a.state}">${stateLabel(a.state)}</span></td>
-          <td>${a.error_count}</td>
-          <td class="text-muted truncate" style="max-width:240px">${esc(a.last_error) || '-'}</td>
-          <td>
-            ${a.state === 'error'
-              ? `<button class="btn btn-sm btn-outline" onclick="reloginAccount(${i})">${ICON.reload} 重登</button>`
-              : '<span class="text-muted text-sm">-</span>'}
-            <button class="btn-icon danger" onclick="removeAccount(${i})" title="删除">${ICON.x}</button>
-          </td>
-        </tr>`).join("")}</tbody>
+        <tbody>${accounts.map(a => renderAccountRow(a)).join("")}</tbody>
       </table>`;
     } catch (e) {
       wrap.innerHTML = `<div class="loading" style="color:var(--red)">加载失败: ${esc(e.message)}</div>`;
     }
   }
 
-  document.getElementById("acct-add-btn").onclick = async () => {
+  document.getElementById("acct-save-btn").onclick = async () => {
     const email = document.getElementById("acct-email").value.trim();
     const token = document.getElementById("acct-token").value.trim();
     const cookies = document.getElementById("acct-cookies").value.trim();
-    if (!token || !cookies) { toast("Token 和 Cookies 不能为空", "err"); return; }
     try {
-      await api("/admin/api/accounts", {
-        method: "POST", body: JSON.stringify({ token, cookies, email }),
-      });
-      toast("账号添加成功");
-      document.getElementById("acct-email").value = "";
-      document.getElementById("acct-token").value = "";
-      document.getElementById("acct-cookies").value = "";
-      loadList();
+      if (STATE.editingAccountId) {
+        const body = { email };
+        if (token) body.token = token;
+        if (cookies) body.cookies = cookies;
+        await api(`/admin/api/accounts/${encodeURIComponent(STATE.editingAccountId)}`, {
+          method: "PUT", body: JSON.stringify(body),
+        });
+        toast("账号已保存");
+        clearAccountEdit();
+        renderAccounts(el);
+      } else {
+        if (!token || !cookies) { toast("Token 和 Cookies 不能为空", "err"); return; }
+        await api("/admin/api/accounts", {
+          method: "POST", body: JSON.stringify({ token, cookies, email }),
+        });
+        toast("账号添加成功");
+        document.getElementById("acct-email").value = "";
+        document.getElementById("acct-token").value = "";
+        document.getElementById("acct-cookies").value = "";
+        loadList();
+      }
     } catch (e) { toast(e.message, "err"); }
   };
 
+  const cancelBtn = document.getElementById("acct-cancel-btn");
+  if (cancelBtn) cancelBtn.onclick = () => { clearAccountEdit(); renderAccounts(el); };
   document.getElementById("acct-refresh-btn").onclick = loadList;
+  wrap.onclick = (event) => {
+    const btn = event.target.closest("[data-action]");
+    if (!btn) return;
+    const id = btn.dataset.id;
+    if (btn.dataset.action === "edit") editAccount(id, btn.dataset.email || "");
+    else if (btn.dataset.action === "delete") removeAccount(id);
+    else if (btn.dataset.action === "relogin") reloginAccount(id);
+  };
 
   loadList();
 }
 
+function renderAccountRow(a) {
+  const readOnly = a.read_only || a.source === "env";
+  const editBtn = readOnly
+    ? '<span class="text-muted text-sm">env只读</span>'
+    : `<button class="btn btn-sm btn-outline" data-action="edit" data-id="${escAttr(a.id)}" data-email="${escAttr(a.email || '')}">${ICON.edit} 编辑</button>`;
+  const deleteBtn = readOnly
+    ? ''
+    : `<button class="btn-icon danger" data-action="delete" data-id="${escAttr(a.id)}" title="删除">${ICON.x}</button>`;
+  const reloginBtn = a.state === 'error'
+    ? `<button class="btn btn-sm btn-outline" data-action="relogin" data-id="${escAttr(a.id)}">${ICON.reload} 重登</button>`
+    : '';
+  const actions = readOnly ? (reloginBtn || editBtn) : `${reloginBtn}${editBtn}${deleteBtn}`;
+  return `<tr>
+    <td><span class="truncate" style="max-width:160px;display:inline-block" title="${escAttr(a.id)}">${esc(a.email || a.id)}</span></td>
+    <td><span class="badge ${a.source === 'env' ? 'busy' : 'idle'}">${esc(a.source)}</span></td>
+    <td><span class="badge ${escAttr(a.state)}">${stateLabel(a.state)}</span></td>
+    <td><span class="truncate code-inline" title="${escAttr(a.credential_fingerprint || '')}">${esc(a.token_preview || '-')}</span></td>
+    <td><span class="truncate" style="max-width:180px;display:inline-block">${esc(a.cookies_preview || '-')}</span></td>
+    <td>${a.error_count ?? 0}</td>
+    <td class="text-muted truncate" style="max-width:180px">${esc(a.last_error) || '-'}</td>
+    <td><div class="flex items-center gap-2">${actions}</div></td>
+  </tr>`;
+}
+
 /* ── Account actions (global for onclick) ─────────────────── */
-async function reloginAccount(index) {
+function setAccountEditMode(id, email = "") {
+  STATE.editingAccountId = id;
+  STATE.editingAccountEmail = email || "";
+
+  const title = document.getElementById("acct-form-title");
+  const emailInput = document.getElementById("acct-email");
+  const tokenInput = document.getElementById("acct-token");
+  const cookiesInput = document.getElementById("acct-cookies");
+  const saveBtn = document.getElementById("acct-save-btn");
+  const cancelBtn = document.getElementById("acct-cancel-btn");
+
+  if (title) title.textContent = id ? "编辑账号" : "添加账号";
+  if (emailInput) emailInput.value = email || "";
+  if (tokenInput) {
+    tokenInput.value = "";
+    tokenInput.placeholder = id ? "留空则不修改 Token" : "Authorization Bearer token（不要带 Bearer）";
+  }
+  if (cookiesInput) {
+    cookiesInput.value = "";
+    cookiesInput.placeholder = id ? "留空则不修改 Cookies" : "cf_clearance=...; session=...";
+  }
+  if (saveBtn) saveBtn.innerHTML = id ? `${ICON.edit} 保存` : `${ICON.plus} 添加`;
+  if (cancelBtn) cancelBtn.style.display = id ? "" : "none";
+  if (emailInput) {
+    emailInput.scrollIntoView({ behavior: "smooth", block: "center" });
+    emailInput.focus();
+    emailInput.select();
+  }
+}
+
+function editAccount(id, email) {
+  setAccountEditMode(id, email);
+  toast("已进入编辑模式：留空 Token/Cookies 表示不修改", "ok");
+}
+
+function clearAccountEdit() {
+  setAccountEditMode(null, "");
+}
+
+async function reloginAccount(id) {
   try {
-    const res = await api(`/admin/api/accounts/${index}/relogin`, { method: "POST" });
+    const res = await api(`/admin/api/accounts/${encodeURIComponent(id)}/relogin`, { method: "POST" });
     if (res.ok) { toast("重登录成功"); render(); }
     else { toast(`重登录失败: ${res.message}`, "err"); render(); }
   } catch (e) { toast(e.message, "err"); }
 }
 
-async function removeAccount(index) {
+async function removeAccount(id) {
   if (!confirm("确定删除此账号？")) return;
   try {
-    await api(`/admin/api/accounts/${index}`, { method: "DELETE" });
+    await api(`/admin/api/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
     toast("账号已删除");
     render();
   } catch (e) { toast(e.message, "err"); }
@@ -324,10 +406,18 @@ function stateLabel(s) {
 }
 
 function esc(s) {
-  if (!s) return "";
+  if (s === null || s === undefined) return "";
   const d = document.createElement("div");
-  d.textContent = s;
+  d.textContent = String(s);
   return d.innerHTML;
+}
+
+function escAttr(s) {
+  return esc(s).replace(/"/g, "&quot;");
+}
+
+function js(s) {
+  return JSON.stringify(String(s || "")).replace(/</g, "\\u003c");
 }
 
 /* ── Init ─────────────────────────────────────────────────── */
