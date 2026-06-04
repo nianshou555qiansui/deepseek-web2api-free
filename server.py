@@ -4,6 +4,7 @@ Supports streaming, tool calling (via DSML prompt injection), content parts, exp
 """
 import json
 import os
+import secrets
 import time
 import uuid
 from typing import Optional, Union, Any
@@ -12,7 +13,7 @@ import uvicorn
 from dotenv import load_dotenv
 import os as _os
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,6 +42,50 @@ MODE = os.environ.get("MODE", "auto").strip().lower()
 THINKING = os.environ.get("THINKING", "auto").strip().lower()
 SEARCH = os.environ.get("SEARCH", "auto").strip().lower()
 PORT = int(os.environ.get("PORT", "8080"))
+ALLOW_UNAUTHENTICATED_API = os.environ.get("ALLOW_UNAUTHENTICATED_API", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_api_keys() -> list[str]:
+    keys = []
+    raw_keys = os.environ.get("API_KEYS", "")
+    for item in raw_keys.split(","):
+        item = item.strip()
+        if item:
+            keys.append(item)
+    single_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if single_key:
+        keys.append(single_key)
+
+    deduped = []
+    seen = set()
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            deduped.append(key)
+    return deduped
+
+
+API_KEYS = _load_api_keys()
+
+
+def _extract_api_key(request: Request) -> str:
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.headers.get("x-api-key", "").strip()
+
+
+def _check_api_auth(request: Request):
+    if ALLOW_UNAUTHENTICATED_API:
+        return
+    if not API_KEYS:
+        raise HTTPException(status_code=503, detail="API key authentication is not configured")
+    supplied = _extract_api_key(request)
+    if not supplied:
+        raise HTTPException(status_code=401, detail="Missing API key")
+    if not any(secrets.compare_digest(supplied, key) for key in API_KEYS):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
 
 app = FastAPI(title="DeepSeek Chat API (Expert Preview)", version="2.1.0-pre")
 
@@ -284,14 +329,16 @@ async def health():
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(request: Request):
+    _check_api_auth(request)
     return ModelList(data=[
         ModelInfo(id=MODEL_NAME, created=int(time.time())),
     ])
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(req: ChatCompletionRequest, request: Request):
+    _check_api_auth(request)
     proxy_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     prompt = _build_prompt(req.messages, req.tools)
 
@@ -327,7 +374,8 @@ async def chat_completions(req: ChatCompletionRequest):
 
 
 @app.post("/v1/messages")
-async def messages(req: AnthropicRequest):
+async def messages(req: AnthropicRequest, request: Request):
+    _check_api_auth(request)
     proxy_id = _msg_id()
     system_str = req.system
     if isinstance(system_str, list):
@@ -393,6 +441,7 @@ def _anthropic_nonstream(msg_id: str, prompt: str, tool_names: list[str],
         get_stats().record(MODEL_NAME, lat)
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
+        pool.mark_error(acq.acct, str(e))
         raise
     finally:
         acq.release()
@@ -409,7 +458,13 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
                             model_type: str | None = None,
                             thinking_mode: bool = False, search_enabled: bool = False):
     acq = _acquire()
-    ds_id = acq.create_session()
+    try:
+        ds_id = acq.create_session()
+    except Exception as e:
+        get_stats().record(MODEL_NAME, 0, success=False)
+        pool.mark_error(acq.acct, str(e))
+        acq.release()
+        raise
     t0 = time.time()
 
     async def event_stream():
@@ -426,8 +481,9 @@ async def _anthropic_stream(msg_id: str, prompt: str, tool_names: list[str],
             ):
                 yield event
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
-        except Exception:
+        except Exception as e:
             get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False)
+            pool.mark_error(acq.acct, str(e))
             raise
         finally:
             acq.release()
@@ -458,6 +514,7 @@ def _handle_nonstream(proxy_id: str, prompt: str, tools: list[ToolDef] | None = 
         get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
     except Exception as e:
         get_stats().record(MODEL_NAME, 0, success=False)
+        pool.mark_error(acq.acct, str(e))
         raise
     finally:
         acq.release()
@@ -505,7 +562,13 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                          thinking_mode: bool = False, search_enabled: bool = False):
     """Streaming completion with StreamSieve tool call detection and expert mode support."""
     acq = _acquire()
-    ds_id = acq.create_session()
+    try:
+        ds_id = acq.create_session()
+    except Exception as e:
+        get_stats().record(MODEL_NAME, 0, success=False)
+        pool.mark_error(acq.acct, str(e))
+        acq.release()
+        raise
     tool_names = _get_tool_names(tools)
     t0 = time.time()
 
@@ -589,8 +652,11 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
 
             yield _openai_chunk(proxy_id, finish=True)
             yield "data: [DONE]\n\n"
+        except Exception as e:
+            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000, success=False)
+            pool.mark_error(acq.acct, str(e))
+            raise
         finally:
-            get_stats().record(MODEL_NAME, (time.time() - t0) * 1000)
             acq.release()
 
     return StreamingResponse(

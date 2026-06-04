@@ -1,15 +1,11 @@
 """
 Admin API — authentication, statistics tracking, account pool management.
 """
-import json
 import os
 import secrets
 import time
-import hashlib
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from account_pool import AccountPool
@@ -23,10 +19,6 @@ _tokens: set[str] = set()
 
 def _generate_token() -> str:
     return secrets.token_hex(32)
-
-
-def _hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def _verify_token(token: str) -> bool:
@@ -91,7 +83,13 @@ class LoginResponse(BaseModel):
 class AccountAddRequest(BaseModel):
     token: str
     cookies: str
-    email: Optional[str] = ""
+    email: str | None = ""
+
+
+class AccountUpdateRequest(BaseModel):
+    token: str | None = None
+    cookies: str | None = None
+    email: str | None = None
 
 
 class AccountReloginResponse(BaseModel):
@@ -109,6 +107,18 @@ def _check_auth(request: Request):
     token = auth.removeprefix("Bearer ").strip()
     if not _verify_token(token):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _pool_error(e: Exception):
+    if isinstance(e, KeyError):
+        raise HTTPException(status_code=404, detail=str(e).strip("'"))
+    if isinstance(e, PermissionError):
+        raise HTTPException(status_code=400, detail=str(e))
+    if isinstance(e, RuntimeError):
+        raise HTTPException(status_code=409, detail=str(e))
+    if isinstance(e, ValueError):
+        raise HTTPException(status_code=400, detail=str(e))
+    raise e
 
 
 @router.post("/login")
@@ -152,23 +162,40 @@ async def list_accounts(request: Request):
 async def add_account(req: AccountAddRequest, request: Request):
     _check_auth(request)
     pool = get_pool()
-    acct = pool.add(token=req.token, cookies=req.cookies, email=req.email)
-    return {"ok": True, "email": acct.email}
+    try:
+        acct = pool.add(token=req.token, cookies=req.cookies, email=req.email or "")
+    except Exception as e:
+        _pool_error(e)
+    return {"ok": True, "account": acct.to_dict()}
 
 
-@router.delete("/accounts/{index}")
-async def remove_account(index: int, request: Request):
+@router.put("/accounts/{account_id}")
+async def update_account(account_id: str, req: AccountUpdateRequest, request: Request):
     _check_auth(request)
     pool = get_pool()
-    ok = pool.remove(index)
+    try:
+        acct = pool.update(account_id, token=req.token, cookies=req.cookies, email=req.email)
+    except Exception as e:
+        _pool_error(e)
+    return {"ok": True, "account": acct.to_dict()}
+
+
+@router.delete("/accounts/{account_id}")
+async def remove_account(account_id: str, request: Request):
+    _check_auth(request)
+    pool = get_pool()
+    try:
+        ok = pool.remove_by_id(account_id)
+    except Exception as e:
+        _pool_error(e)
     if not ok:
         raise HTTPException(status_code=404, detail="Account not found")
     return {"ok": True}
 
 
-@router.post("/accounts/{index}/relogin")
-async def relogin_account(index: int, request: Request) -> AccountReloginResponse:
+@router.post("/accounts/{account_id}/relogin")
+async def relogin_account(account_id: str, request: Request) -> AccountReloginResponse:
     _check_auth(request)
     pool = get_pool()
-    ok, msg = pool.relogin(index)
+    ok, msg = pool.relogin_by_id(account_id)
     return AccountReloginResponse(ok=ok, message=msg)
