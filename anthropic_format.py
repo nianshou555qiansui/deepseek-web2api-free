@@ -159,19 +159,22 @@ def build_anthropic_prompt(
                         bt = block.get("type", "")
                         if bt == "tool_result":
                             tc = block.get("content", "")
+                            tool_use_id = block.get("tool_use_id", "")
+                            prefix = f"Tool result (call_id={tool_use_id}):" if tool_use_id else "Tool result:"
                             if isinstance(tc, str):
-                                text_parts.append(tc)
+                                text_parts.append(f"{prefix} {tc}")
                             elif isinstance(tc, list):
-                                text_parts.append(_extract_text_from_blocks(tc))
+                                text_parts.append(f"{prefix} {_extract_text_from_blocks(tc)}")
                         elif bt == "text":
                             text_parts.append(block.get("text", ""))
                     elif isinstance(block, ContentBlock):
                         if block.type == "tool_result":
                             tc = block.content
+                            prefix = f"Tool result (call_id={block.tool_use_id}):" if block.tool_use_id else "Tool result:"
                             if isinstance(tc, str):
-                                text_parts.append(tc)
+                                text_parts.append(f"{prefix} {tc}")
                             elif isinstance(tc, list):
-                                text_parts.append(_extract_text_from_blocks(tc))
+                                text_parts.append(f"{prefix} {_extract_text_from_blocks(tc)}")
                         elif block.type == "text":
                             text_parts.append(block.text or "")
                 if text_parts:

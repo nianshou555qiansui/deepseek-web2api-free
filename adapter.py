@@ -158,6 +158,7 @@ class DeepSeekAdapter:
             json={"target_path": "/api/v0/chat/completion"},
             headers=headers,
         )
+        resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 0:
             raise RuntimeError(f"Session creation failed: {data}")
@@ -189,7 +190,6 @@ class DeepSeekAdapter:
                          thinking_enabled: bool = False, search_enabled: bool = False):
         """Send a completion request, returns raw response"""
         headers = self._pow_headers("/api/v0/chat/completion")
-        # Auto-increment parent_message_id per session
         mid = self._msg_counters.get(session_id, 0) + 1
         self._msg_counters[session_id] = mid
         body = {
@@ -203,11 +203,13 @@ class DeepSeekAdapter:
             "search_enabled": search_enabled,
             "preempt": False,
         }
-        return self._client.post(
+        resp = self._client.post(
             f"{BASE_URL}/api/v0/chat/completion",
             json=body,
             headers=headers,
         )
+        resp.raise_for_status()
+        return resp
 
     def chat(self, session_id: str, prompt: str, model_type: str | None = None,
              thinking_enabled: bool = False, search_enabled: bool = False) -> str:
@@ -310,6 +312,7 @@ class DeepSeekAdapter:
             "POST", f"{BASE_URL}/api/v0/chat/completion",
             json=body, headers=headers,
         ) as resp:
+            resp.raise_for_status()
             frag_type = None  # None, 'thinking', 'content'
 
             for line in resp.iter_lines():

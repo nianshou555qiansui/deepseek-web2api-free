@@ -239,10 +239,32 @@ def _escape_xml_attr(text: str) -> str:
     return text.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def build_dsml_tool_prompt(tools: list[dict]) -> str:
+def build_dsml_tool_prompt(tools: list[dict], tool_choice: str | dict | None = None) -> str:
     """构建工具调用提示词，附加到 system message。"""
     if not tools:
         return ""
+
+    choice_instruction = ""
+    if tool_choice is not None:
+        if tool_choice == "none":
+            return ""
+        elif tool_choice == "required":
+            choice_instruction = (
+                "You MUST call at least one of the available tools. "
+                "Do not answer the user directly — always use a tool call.\n\n"
+            )
+        elif isinstance(tool_choice, dict):
+            fn_name = tool_choice.get("function", {}).get("name", "")
+            if fn_name:
+                choice_instruction = (
+                    f"You MUST call the tool '{fn_name}'. "
+                    f"Do not call any other tool and do not answer the user directly.\n\n"
+                )
+        elif isinstance(tool_choice, str) and tool_choice not in ("auto", "required", "none"):
+            choice_instruction = (
+                f"You MUST call the tool '{tool_choice}'. "
+                f"Do not call any other tool and do not answer the user directly.\n\n"
+            )
 
     prompt = """You have access to tools. When you need to call a tool, respond with EXACTLY this format — no markdown fences, no extra text before or after:
 
@@ -260,8 +282,7 @@ RULES:
 - First non-whitespace character must be < for tool calls
 - NO explanations, NO markdown fences, NO extra text
 
-Available tools:
-"""
+""" + choice_instruction + "Available tools:\n"
     for tool in tools:
         fn = tool.get("function", {})
         name = fn.get("name") or tool.get("name", "")

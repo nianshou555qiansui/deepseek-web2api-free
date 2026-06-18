@@ -117,17 +117,17 @@ class StreamSieve:
 
     def _split_safe(self, text: str) -> tuple[str, str]:
         last_lt = text.rfind("<")
-        if last_lt == -1:
-            last_lt = text.rfind("|")
-        if last_lt == -1:
+        last_pipe = text.rfind("|")
+        last_special = last_lt if last_lt >= last_pipe else last_pipe
+        if last_special == -1:
             return text, ""
-        tail = text[last_lt:]
+        tail = text[last_special:]
         for tag in self._TOOL_STARTS:
             if tag.startswith(tail) or tail == tag[:len(tail)]:
-                return text[:last_lt], tail
+                return text[:last_special], tail
         for prefix in ("<|DSML|", "|DSML|", "<tool_calls", "<tool_call", "<invoke"):
             if prefix.startswith(tail) or (len(tail) <= len(prefix) and tail == prefix[:len(tail)]):
-                return text[:last_lt], tail
+                return text[:last_special], tail
         return text, ""
 
     def _try_finish_capture(self):

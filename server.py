@@ -208,21 +208,24 @@ def _extract_text(content: Union[str, list[ContentPart], None]) -> str:
     )
 
 
-def _build_prompt(messages: list[ChatMessage], tools: list[ToolDef] | None = None) -> str:
+def _build_prompt(messages: list[ChatMessage], tools: list[ToolDef] | None = None,
+                  tool_choice: str | dict | None = None) -> str:
     """Build a prompt string from messages, injecting tool definitions if present."""
     parts = []
 
     tool_prompt_text = None
     if tools:
-        tool_prompt_text = build_dsml_tool_prompt([t.model_dump() for t in tools])
+        tool_prompt_text = build_dsml_tool_prompt([t.model_dump() for t in tools], tool_choice)
 
     has_system_message = any(m.role == "system" for m in messages)
+    tool_injected = False
 
     for m in messages:
         if m.role == "system":
             text = _extract_text(m.content)
-            if tool_prompt_text:
+            if tool_prompt_text and not tool_injected:
                 text = text + "\n\n" + tool_prompt_text if text else tool_prompt_text
+                tool_injected = True
             if text:
                 parts.append(f"System: {text}")
         elif m.role == "user":
@@ -240,9 +243,9 @@ def _build_prompt(messages: list[ChatMessage], tools: list[ToolDef] | None = Non
                 parts.append(f"Assistant: {' '.join(segs)}")
         elif m.role == "tool":
             result = _extract_text(m.content)
-            parts.append(f"Tool result: {result[:1000]}")
+            prefix = f"Tool result (call_id={m.tool_call_id}):" if m.tool_call_id else "Tool result:"
+            parts.append(f"{prefix} {result[:1000]}")
 
-    # Only inject standalone tool prompt if there is no system message to attach it to
     if tool_prompt_text and not has_system_message:
         parts.insert(0, f"System: {tool_prompt_text}")
 
@@ -252,9 +255,11 @@ def _build_prompt(messages: list[ChatMessage], tools: list[ToolDef] | None = Non
 # ---- OpenAI SSE helpers ----
 
 def _openai_chunk(proxy_id: str, content: str = "", finish: bool = False,
-                  reasoning_content: str = None) -> str:
+                  reasoning_content: str = None, role: str = None) -> str:
     delta = {}
     if not finish:
+        if role:
+            delta["role"] = role
         if reasoning_content is not None:
             delta["reasoning_content"] = reasoning_content
         elif content:
@@ -340,7 +345,7 @@ async def list_models(request: Request):
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     _check_api_auth(request)
     proxy_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    prompt = _build_prompt(req.messages, req.tools)
+    prompt = _build_prompt(req.messages, req.tools, req.tool_choice)
 
     # MODE controls model_type (quick → "default", expert → "expert")
     if MODE == "expert":
@@ -598,7 +603,7 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                         content = token.get("content", "")
                         if content:
                             if not role_sent:
-                                yield _openai_chunk(proxy_id, reasoning_content="")
+                                yield _openai_chunk(proxy_id, reasoning_content="", role="assistant")
                                 role_sent = True
                             yield _openai_chunk(proxy_id, reasoning_content=content)
                         continue
@@ -611,8 +616,10 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                             if not role_sent:
                                 if thinking_mode:
                                     yield _openai_chunk(proxy_id, reasoning_content="")
+                                yield _openai_chunk(proxy_id, content=evt.data, role="assistant")
                                 role_sent = True
-                            yield _openai_chunk(proxy_id, content=evt.data)
+                            else:
+                                yield _openai_chunk(proxy_id, content=evt.data)
                     elif evt.type == "tool_calls":
                         for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
                             yield chunk
@@ -626,8 +633,10 @@ async def _handle_stream(proxy_id: str, prompt: str, tools: list[ToolDef] | None
                     if not role_sent:
                         if thinking_mode:
                             yield _openai_chunk(proxy_id, reasoning_content="")
+                        yield _openai_chunk(proxy_id, content=evt.data, role="assistant")
                         role_sent = True
-                    yield _openai_chunk(proxy_id, content=evt.data)
+                    else:
+                        yield _openai_chunk(proxy_id, content=evt.data)
                 elif evt.type == "tool_calls":
                     had_tool = True
                     for chunk in _emit_tool_calls_chunks(evt.data, proxy_id):
